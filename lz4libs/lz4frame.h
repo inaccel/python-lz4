@@ -107,6 +107,12 @@ LZ4FLIB_API const char* LZ4F_getErrorName(LZ4F_errorCode_t code);   /**< return 
 
 
 /*-************************************
+ *  FPGA acceleration management
+ **************************************/
+#define CHUNK_PARALLELISM 8
+
+
+/*-************************************
  *  Frame compression types
  ************************************* */
 /* #define LZ4F_ENABLE_OBSOLETE_ENUMS   // uncomment to enable obsolete enums */
@@ -131,6 +137,13 @@ typedef enum {
     LZ4F_OBSOLETE_ENUM(max1MB)
     LZ4F_OBSOLETE_ENUM(max4MB)
 } LZ4F_blockSizeID_t;
+
+typedef enum {
+    LZ4F_max16MB=0,
+    LZ4F_max32MB,
+    LZ4F_max64MB,
+    LZ4F_max128MB
+} LZ4F_chunkSizeID_t;
 
 /* Linked blocks sharply reduce inefficiencies when using small blocks,
  * they compress better.
@@ -162,6 +175,7 @@ typedef enum {
 
 #ifdef LZ4F_ENABLE_OBSOLETE_ENUMS
 typedef LZ4F_blockSizeID_t blockSizeID_t;
+typedef LZ4F_chunkSizeID_t chunkSizeID_t;
 typedef LZ4F_blockMode_t blockMode_t;
 typedef LZ4F_frameType_t frameType_t;
 typedef LZ4F_contentChecksum_t contentChecksum_t;
@@ -180,9 +194,10 @@ typedef struct {
   unsigned long long     contentSize;         /* Size of uncompressed content ; 0 == unknown */
   unsigned               dictID;              /* Dictionary ID, sent by compressor to help decoder select correct dictionary; 0 == no dictID provided */
   LZ4F_blockChecksum_t   blockChecksumFlag;   /* 1: each block followed by a checksum of block's compressed data; 0: disabled (default) */
+  LZ4F_chunkSizeID_t     chunkSizeID;         /* max32MB, max64MB, max128MB, max256MB; 0 == default */
 } LZ4F_frameInfo_t;
 
-#define LZ4F_INIT_FRAMEINFO   { LZ4F_default, LZ4F_blockLinked, LZ4F_noContentChecksum, LZ4F_frame, 0ULL, 0U, LZ4F_noBlockChecksum }    /* v1.8.3+ */
+#define LZ4F_INIT_FRAMEINFO   { LZ4F_default, LZ4F_blockLinked, LZ4F_noContentChecksum, LZ4F_frame, 0ULL, 0U, LZ4F_noBlockChecksum, LZ4F_max32MB }    /* v1.8.3+ */
 
 /*! LZ4F_preferences_t :
  *  makes it possible to supply advanced compression instructions to streaming interface.
@@ -195,9 +210,10 @@ typedef struct {
   unsigned autoFlush;           /* 1: always flush; reduces usage of internal buffers */
   unsigned favorDecSpeed;       /* 1: parser favors decompression speed vs compression ratio. Only works for high compression modes (>= LZ4HC_CLEVEL_OPT_MIN) */  /* v1.8.2+ */
   unsigned reserved[3];         /* must be zero for forward compatibility */
+  int      mode;                /* 0: default (FPGA); 1: CPU */
 } LZ4F_preferences_t;
 
-#define LZ4F_INIT_PREFERENCES   { LZ4F_INIT_FRAMEINFO, 0, 0u, 0u, { 0u, 0u, 0u } }    /* v1.8.3+ */
+#define LZ4F_INIT_PREFERENCES   { LZ4F_INIT_FRAMEINFO, 0, 0u, 0u, { 0u, 0u, 0u }, 0 }    /* v1.8.3+ */
 
 
 /*-*********************************
@@ -512,6 +528,7 @@ extern "C" {
         ITEM(OK_NoError) \
         ITEM(ERROR_GENERIC) \
         ITEM(ERROR_maxBlockSize_invalid) \
+        ITEM(ERROR_maxChunkSize_invalid) \
         ITEM(ERROR_blockMode_invalid) \
         ITEM(ERROR_contentChecksumFlag_invalid) \
         ITEM(ERROR_compressionLevel_invalid) \
@@ -529,6 +546,7 @@ extern "C" {
         ITEM(ERROR_headerChecksum_invalid) \
         ITEM(ERROR_contentChecksum_invalid) \
         ITEM(ERROR_frameDecoding_alreadyStarted) \
+        ITEM(ERROR_FPGAcompressionFailed) \
         ITEM(ERROR_maxCode)
 
 #define LZ4F_GENERATE_ENUM(ENUM) LZ4F_##ENUM,

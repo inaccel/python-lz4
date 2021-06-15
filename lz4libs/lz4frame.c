@@ -40,6 +40,7 @@
  * (see Memory Routines below).
  */
 
+#include <inaccel/coral.h>
 
 /*-************************************
 *  Compiler Options
@@ -220,6 +221,18 @@ static const size_t BFSize = LZ4F_BLOCK_CHECKSUM_SIZE;  /* block footer : checks
 /*-************************************
 *  Structures and local types
 **************************************/
+typedef struct {
+    BYTE *in[CHUNK_PARALLELISM];
+    BYTE *out[CHUNK_PARALLELISM];
+    U32 *inBlockSize[CHUNK_PARALLELISM];
+    U32 *outBlockSize[CHUNK_PARALLELISM];
+    inaccel_response response[CHUNK_PARALLELISM];
+    U32 numBlocks[CHUNK_PARALLELISM];
+    U32 chunkSize[CHUNK_PARALLELISM];;
+    U32 maxBlocksPerChunk;
+    U32 maxChunkSize;
+} FPGA;
+
 typedef struct LZ4F_cctx_s
 {
     LZ4F_preferences_t prefs;
@@ -236,6 +249,7 @@ typedef struct LZ4F_cctx_s
     void*  lz4CtxPtr;
     U16    lz4CtxAlloc; /* sized for: 0 = none, 1 = lz4 ctx, 2 = lz4hc ctx */
     U16    lz4CtxState; /* in use as: 0 = none, 1 = lz4 ctx, 2 = lz4hc ctx */
+    FPGA *fpgaPtr;
 } LZ4F_cctx_t;
 
 
@@ -286,6 +300,15 @@ size_t LZ4F_getBlockSize(unsigned blockSizeID)
     return blockSizes[blockSizeID];
 }
 
+size_t LZ4F_getChunkSize(unsigned chunkSizeID)
+{
+    static const size_t chunkSizes[4] = { 16 MB, 32 MB, 64 MB, 128 MB };
+
+    if (chunkSizeID > LZ4F_max128MB)
+        return err0r(LZ4F_ERROR_maxChunkSize_invalid);
+    return chunkSizes[chunkSizeID];
+}
+
 /*-************************************
 *  Private functions
 **************************************/
@@ -331,8 +354,10 @@ static size_t LZ4F_compressBound_internal(size_t srcSize,
     {   const LZ4F_preferences_t* const prefsPtr = (preferencesPtr==NULL) ? &prefsNull : preferencesPtr;
         U32 const flush = prefsPtr->autoFlush | (srcSize==0);
         LZ4F_blockSizeID_t const blockID = prefsPtr->frameInfo.blockSizeID;
+        LZ4F_chunkSizeID_t const chunkID = prefsPtr->frameInfo.chunkSizeID;
         size_t const blockSize = LZ4F_getBlockSize(blockID);
-        size_t const maxBuffered = blockSize - 1;
+        size_t const chunkSize = LZ4F_getChunkSize(chunkID);
+        size_t const maxBuffered = prefsPtr->mode ? blockSize - 1 : (srcSize ? blockSize - 1 : chunkSize - 1);
         size_t const bufferedSize = MIN(alreadyBuffered, maxBuffered);
         size_t const maxSrcSize = srcSize + bufferedSize;
         unsigned const nbFullBlocks = (unsigned)(maxSrcSize / blockSize);
@@ -641,9 +666,18 @@ size_t LZ4F_compressBegin_usingCDict(LZ4F_cctx* cctxPtr,
         cctxPtr->prefs.frameInfo.blockSizeID = LZ4F_BLOCKSIZEID_DEFAULT;
     cctxPtr->maxBlockSize = LZ4F_getBlockSize(cctxPtr->prefs.frameInfo.blockSizeID);
 
-    {   size_t const requiredBuffSize = preferencesPtr->autoFlush ?
+    if (!cctxPtr->prefs.mode) {
+        cctxPtr->prefs.frameInfo.blockMode = LZ4F_blockIndependent;
+
+        /* Initialize FPGA Buffers */
+        cctxPtr->fpgaPtr = (FPGA *) calloc(1, sizeof(FPGA));
+        cctxPtr->fpgaPtr->maxChunkSize = LZ4F_getChunkSize(cctxPtr->prefs.frameInfo.chunkSizeID);
+        cctxPtr->fpgaPtr->maxBlocksPerChunk = cctxPtr->fpgaPtr->maxChunkSize / cctxPtr->maxBlockSize;
+    }
+    {   size_t buffSize = cctxPtr->prefs.mode ? cctxPtr->maxBlockSize : cctxPtr->fpgaPtr->maxChunkSize;
+        size_t const requiredBuffSize = preferencesPtr->autoFlush ?
                 ((cctxPtr->prefs.frameInfo.blockMode == LZ4F_blockLinked) ? 64 KB : 0) :  /* only needs past data up to window size */
-                cctxPtr->maxBlockSize + ((cctxPtr->prefs.frameInfo.blockMode == LZ4F_blockLinked) ? 128 KB : 0);
+                buffSize + ((cctxPtr->prefs.frameInfo.blockMode == LZ4F_blockLinked) ? 128 KB : 0);
 
         if (cctxPtr->maxBufferSize < requiredBuffSize) {
             cctxPtr->maxBufferSize = 0;
@@ -763,6 +797,122 @@ static size_t LZ4F_makeBlock(void* dst,
 }
 
 
+static size_t LZ4F_makeChunk(const void *srcPtr, int chunk, FPGA *fpgaPtr, unsigned chunkSize, unsigned blockSize)
+{
+    unsigned idx;
+    fpgaPtr->chunkSize[chunk] = (chunkSize + 511) & (~511);
+    fpgaPtr->in[chunk] = (BYTE *) inaccel_realloc(fpgaPtr->in[chunk], fpgaPtr->chunkSize[chunk]);
+    if (fpgaPtr->in[chunk] == NULL) return err0r(LZ4F_ERROR_allocation_failed);
+    fpgaPtr->out[chunk] = (BYTE *) inaccel_realloc(fpgaPtr->out[chunk], fpgaPtr->chunkSize[chunk]);
+    if (fpgaPtr->out[chunk] == NULL) return err0r(LZ4F_ERROR_allocation_failed);
+    if (!fpgaPtr->inBlockSize[chunk]) {
+        fpgaPtr->inBlockSize[chunk] = (U32 *) inaccel_alloc(fpgaPtr->maxBlocksPerChunk * sizeof(U32));
+        if (fpgaPtr->inBlockSize[chunk]== NULL) return err0r(LZ4F_ERROR_allocation_failed);
+    }
+    if (!fpgaPtr->outBlockSize[chunk]) {
+        fpgaPtr->outBlockSize[chunk] = (U32 *) inaccel_alloc(fpgaPtr->maxBlocksPerChunk * sizeof(U32));
+        if (fpgaPtr->outBlockSize[chunk] == NULL) return err0r(LZ4F_ERROR_allocation_failed);
+    }
+
+    if (chunkSize == fpgaPtr->maxChunkSize) {
+        fpgaPtr->numBlocks[chunk] = fpgaPtr->maxBlocksPerChunk;
+        for (idx = 0; idx < fpgaPtr->numBlocks[chunk]; idx++) {
+            // first check if contents are the same to skip unsecessary FPGA mem transfers
+            if (fpgaPtr->inBlockSize[chunk][idx] != (U32) blockSize) {
+                fpgaPtr->inBlockSize[chunk][idx] = blockSize;
+            }
+        }
+    }
+    else {
+        fpgaPtr->numBlocks[chunk] = chunkSize / blockSize;
+        for (idx = 0; idx < fpgaPtr->numBlocks[chunk]; idx++) {
+                fpgaPtr->inBlockSize[chunk][idx] = blockSize;
+        }
+        if (chunkSize % blockSize) {
+            fpgaPtr->inBlockSize[chunk][fpgaPtr->numBlocks[chunk]] = chunkSize % blockSize;
+            fpgaPtr->numBlocks[chunk]++;
+        }
+    }
+    memcpy(fpgaPtr->in[chunk], srcPtr, chunkSize);
+
+    return 0;
+}
+
+
+static size_t LZ4F_runChunk(int chunk, FPGA *fpgaPtr)
+{
+    inaccel_request req = inaccel_request_create("com.xilinx.vitis.dataCompression.lz4.compress");
+    fpgaPtr->response[chunk] = NULL;
+    if (!req) return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    if (inaccel_request_arg_array(req, fpgaPtr->chunkSize[chunk], fpgaPtr->in[chunk], 0)) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    if (inaccel_request_arg_array(req, fpgaPtr->chunkSize[chunk], fpgaPtr->out[chunk], 1)) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    if (inaccel_request_arg_array(req, fpgaPtr->maxBlocksPerChunk * sizeof(U32), fpgaPtr->outBlockSize[chunk], 2)) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    if (inaccel_request_arg_array(req, fpgaPtr->maxBlocksPerChunk * sizeof(U32), fpgaPtr->inBlockSize[chunk], 3)) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    if (inaccel_request_arg_scalar(req, sizeof(unsigned), &fpgaPtr->numBlocks[chunk], 4)) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+
+    fpgaPtr->response[chunk] = inaccel_response_create();
+    if (!fpgaPtr->response[chunk]) {
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    if (inaccel_submit(req, fpgaPtr->response[chunk])) {
+        inaccel_response_release(fpgaPtr->response[chunk]);
+        inaccel_request_release(req);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    inaccel_request_release(req);
+
+    return 0;
+}
+
+
+static size_t LZ4F_waitChunk(void *dst, int chunk, FPGA *fpgaPtr, int blockSize, LZ4F_blockChecksum_t crcFlag)
+{
+    unsigned idx, compressedSize = 0;
+    BYTE* cSizePtr = (BYTE*)dst;
+
+    if (inaccel_response_wait(fpgaPtr->response[chunk])) {
+        inaccel_response_fprint(stderr, fpgaPtr->response[chunk]);
+        inaccel_response_release(fpgaPtr->response[chunk]);
+        return err0r(LZ4F_ERROR_FPGAcompressionFailed);
+    }
+    inaccel_response_release(fpgaPtr->response[chunk]);
+
+    for (idx = 0; idx < fpgaPtr->numBlocks[chunk]; idx++) {
+        if ((fpgaPtr->outBlockSize[chunk][idx] == 0) || (fpgaPtr->outBlockSize[chunk][idx] >= fpgaPtr->inBlockSize[chunk][idx])) {
+            fpgaPtr->outBlockSize[chunk][idx] = fpgaPtr->inBlockSize[chunk][idx];
+            LZ4F_writeLE32(cSizePtr, fpgaPtr->outBlockSize[chunk][idx] | LZ4F_BLOCKUNCOMPRESSED_FLAG);
+            memcpy(cSizePtr+BHSize, fpgaPtr->in[chunk] + idx * blockSize, fpgaPtr->inBlockSize[chunk][idx]);
+        } else {
+            LZ4F_writeLE32(cSizePtr, fpgaPtr->outBlockSize[chunk][idx]);
+            memcpy(cSizePtr+BHSize, fpgaPtr->out[chunk] + idx * blockSize, fpgaPtr->outBlockSize[chunk][idx]);
+        }
+        if (crcFlag) {
+            U32 const crc32 = XXH32(cSizePtr+BHSize, fpgaPtr->outBlockSize[chunk][idx], 0);  /* checksum of compressed data */
+            LZ4F_writeLE32(cSizePtr+BHSize+fpgaPtr->outBlockSize[chunk][idx], crc32);
+        }
+        compressedSize += BHSize + fpgaPtr->outBlockSize[chunk][idx] + ((U32)crcFlag)*BFSize;
+        cSizePtr = (BYTE*)dst + compressedSize;
+    }
+    return compressedSize;
+}
+
+
 static int LZ4F_compressBlock(void* ctx, const char* src, char* dst, int srcSize, int dstCapacity, int level, const LZ4F_CDict* cdict)
 {
     int const acceleration = (level < 0) ? -level + 1 : 1;
@@ -815,6 +965,102 @@ static int LZ4F_localSaveDict(LZ4F_cctx_t* cctxPtr)
 
 typedef enum { notDone, fromTmpBuffer, fromSrcBuffer } LZ4F_lastBlockStatus;
 
+/*! LZ4F_compressUpdate_inaccel() :
+ *  LZ4F_compressUpdate_inaccel() can be called repetitively to compress as much data as necessary.
+ *  dstBuffer MUST be >= LZ4F_compressBound(srcSize, preferencesPtr).
+ *  LZ4F_compressOptions_t structure is optional : you can provide NULL as argument.
+ * @return : the number of bytes written into dstBuffer. It can be zero, meaning input data was just buffered.
+ *           or an error code if it fails (which can be tested using LZ4F_isError())
+ */
+size_t LZ4F_compressUpdate_inaccel(LZ4F_cctx* cctxPtr,
+                           void* dstBuffer, size_t dstCapacity,
+                     const void* srcBuffer, size_t srcSize,
+                     const LZ4F_compressOptions_t* compressOptionsPtr)
+{
+    unsigned idx, chunk, done = 0;
+    size_t ret;
+
+    LZ4F_compressOptions_t cOptionsNull;
+    size_t const blockSize = cctxPtr->maxBlockSize;
+    const BYTE* srcPtr = (const BYTE*)srcBuffer;
+    const BYTE* const srcEnd = srcPtr + srcSize;
+    BYTE* const dstStart = (BYTE*)dstBuffer;
+    BYTE* dstPtr = dstStart;
+
+    DEBUGLOG(4, "LZ4F_compressUpdate (srcSize=%zu)", srcSize);
+
+    if (cctxPtr->cStage != 1) return err0r(LZ4F_ERROR_GENERIC);
+    if (dstCapacity < LZ4F_compressBound_internal(srcSize, &(cctxPtr->prefs), cctxPtr->tmpInSize))
+        return err0r(LZ4F_ERROR_dstMaxSize_tooSmall);
+    MEM_INIT(&cOptionsNull, 0, sizeof(cOptionsNull));
+    if (compressOptionsPtr == NULL) compressOptionsPtr = &cOptionsNull;
+
+    /* complete tmp buffer */
+    if (cctxPtr->tmpInSize > 0) {   /* some data already within tmp buffer */
+        size_t const sizeToCopy = cctxPtr->fpgaPtr->maxChunkSize - cctxPtr->tmpInSize;
+        if (sizeToCopy > srcSize) {
+            /* add src to tmpIn buffer */
+            memcpy(cctxPtr->tmpIn + cctxPtr->tmpInSize, srcBuffer, srcSize);
+            srcPtr = srcEnd;
+            cctxPtr->tmpInSize += srcSize;
+            done = 1;
+            /* still needs some CRC */
+        } else {
+            /* complete tmpIn block and then compress it */
+            memcpy(cctxPtr->tmpIn + cctxPtr->tmpInSize, srcBuffer, sizeToCopy);
+            srcPtr += sizeToCopy;
+        }
+    }
+
+    while (!done) {
+        for (chunk = 0; chunk < CHUNK_PARALLELISM; chunk++) {
+            if (cctxPtr->tmpInSize) {
+                ret = LZ4F_makeChunk(cctxPtr->tmpIn, chunk, cctxPtr->fpgaPtr, cctxPtr->fpgaPtr->maxChunkSize, blockSize);
+                if (LZ4F_isError(ret)) return ret;
+                cctxPtr->tmpInSize = 0;
+            } else {
+                if ((size_t)(srcEnd - srcPtr) >= cctxPtr->fpgaPtr->maxChunkSize) {
+                    ret = LZ4F_makeChunk(srcPtr, chunk, cctxPtr->fpgaPtr, cctxPtr->fpgaPtr->maxChunkSize, blockSize);
+                    if (LZ4F_isError(ret)) return ret;
+                    srcPtr += cctxPtr->fpgaPtr->maxChunkSize;
+                } else if ((cctxPtr->prefs.autoFlush) && (srcPtr < srcEnd)) {
+                    ret = LZ4F_makeChunk(srcPtr, chunk, cctxPtr->fpgaPtr, (int)(srcEnd - srcPtr), blockSize);
+                    if (LZ4F_isError(ret)) return ret;
+                    srcPtr  = srcEnd;
+                } else {
+                    done = 1;
+                    break;
+                }
+            }
+        }
+
+        for (idx = 0; idx < chunk; idx++) {
+            ret = LZ4F_runChunk(idx, cctxPtr->fpgaPtr);
+            if (LZ4F_isError(ret)) return ret;
+        }
+
+        for (idx = 0; idx < chunk; idx++) {
+            ret = LZ4F_waitChunk(dstPtr, idx, cctxPtr->fpgaPtr, blockSize, cctxPtr->prefs.frameInfo.blockChecksumFlag);
+            if (LZ4F_isError(ret)) return ret;
+            dstPtr += ret;
+        }
+    }
+
+    /* some input data left, necessarily < blockSize */
+    if (srcPtr < srcEnd) {
+        /* fill tmp buffer */
+        size_t const sizeToCopy = (size_t)(srcEnd - srcPtr);
+        memcpy(cctxPtr->tmpIn, srcPtr, sizeToCopy);
+        cctxPtr->tmpInSize = sizeToCopy;
+    }
+
+    if (cctxPtr->prefs.frameInfo.contentChecksumFlag == LZ4F_contentChecksumEnabled)
+        (void)XXH32_update(&(cctxPtr->xxh), srcBuffer, srcSize);
+
+    cctxPtr->totalInSize += srcSize;
+    return (size_t)(dstPtr - dstStart);
+}
+
 /*! LZ4F_compressUpdate() :
  *  LZ4F_compressUpdate() can be called repetitively to compress as much data as necessary.
  *  dstBuffer MUST be >= LZ4F_compressBound(srcSize, preferencesPtr).
@@ -835,6 +1081,10 @@ size_t LZ4F_compressUpdate(LZ4F_cctx* cctxPtr,
     BYTE* dstPtr = dstStart;
     LZ4F_lastBlockStatus lastBlockCompressed = notDone;
     compressFunc_t const compress = LZ4F_selectCompression(cctxPtr->prefs.frameInfo.blockMode, cctxPtr->prefs.compressionLevel);
+
+    if (!cctxPtr->prefs.mode) {
+        return LZ4F_compressUpdate_inaccel(cctxPtr, dstBuffer,dstCapacity, srcBuffer, srcSize, compressOptionsPtr);
+    }
 
     DEBUGLOG(4, "LZ4F_compressUpdate (srcSize=%zu)", srcSize);
 
@@ -927,6 +1177,38 @@ size_t LZ4F_compressUpdate(LZ4F_cctx* cctxPtr,
 }
 
 
+/*! LZ4F_flush_inaccel() :
+ *  When compressed data must be sent immediately, without waiting for a block to be filled,
+ *  invoke LZ4F_flush_inaccel(), which will immediately compress any remaining data stored within LZ4F_cctx.
+ *  The result of the function is the number of bytes written into dstBuffer.
+ *  It can be zero, this means there was no data left within LZ4F_cctx.
+ *  The function outputs an error code if it fails (can be tested using LZ4F_isError())
+ *  LZ4F_compressOptions_t* is optional. NULL is a valid argument.
+ */
+size_t LZ4F_flush_inaccel(LZ4F_cctx* cctxPtr,
+                  void* dstBuffer, size_t dstCapacity,
+            const LZ4F_compressOptions_t* compressOptionsPtr)
+{
+    BYTE* const dstStart = (BYTE*)dstBuffer;
+    BYTE* dstPtr = dstStart;
+
+    if (cctxPtr->tmpInSize == 0) return 0;   /* nothing to flush */
+    if (cctxPtr->cStage != 1) return err0r(LZ4F_ERROR_GENERIC);
+    if (dstCapacity < (cctxPtr->tmpInSize + BHSize + BFSize))
+        return err0r(LZ4F_ERROR_dstMaxSize_tooSmall);
+    (void)compressOptionsPtr;   /* not yet useful */
+
+    LZ4F_makeChunk(cctxPtr->tmpIn, 0, cctxPtr->fpgaPtr, cctxPtr->tmpInSize, cctxPtr->maxBlockSize);
+    LZ4F_runChunk(0, cctxPtr->fpgaPtr);
+    dstPtr += LZ4F_waitChunk(dstPtr, 0, cctxPtr->fpgaPtr, cctxPtr->maxBlockSize, cctxPtr->prefs.frameInfo.blockChecksumFlag);
+    assert(((void)"flush overflows dstBuffer!", (size_t)(dstPtr - dstStart) <= dstCapacity));
+
+    cctxPtr->tmpInSize = 0;
+
+    return (size_t)(dstPtr - dstStart);
+}
+
+
 /*! LZ4F_flush() :
  *  When compressed data must be sent immediately, without waiting for a block to be filled,
  *  invoke LZ4_flush(), which will immediately compress any remaining data stored within LZ4F_cctx.
@@ -942,6 +1224,11 @@ size_t LZ4F_flush(LZ4F_cctx* cctxPtr,
     BYTE* const dstStart = (BYTE*)dstBuffer;
     BYTE* dstPtr = dstStart;
     compressFunc_t compress;
+
+    if (!cctxPtr->prefs.mode) {
+        size_t ret = LZ4F_flush_inaccel(cctxPtr, dstBuffer,dstCapacity, compressOptionsPtr);
+        if (!LZ4F_isError(ret)) return ret;
+    }
 
     if (cctxPtr->tmpInSize == 0) return 0;   /* nothing to flush */
     if (cctxPtr->cStage != 1) return err0r(LZ4F_ERROR_GENERIC);
@@ -989,6 +1276,7 @@ size_t LZ4F_compressEnd(LZ4F_cctx* cctxPtr,
 {
     BYTE* const dstStart = (BYTE*)dstBuffer;
     BYTE* dstPtr = dstStart;
+    int idx;
 
     size_t const flushSize = LZ4F_flush(cctxPtr, dstBuffer, dstCapacity, compressOptionsPtr);
     DEBUGLOG(5,"LZ4F_compressEnd: dstCapacity=%u", (unsigned)dstCapacity);
@@ -1016,6 +1304,17 @@ size_t LZ4F_compressEnd(LZ4F_cctx* cctxPtr,
     if (cctxPtr->prefs.frameInfo.contentSize) {
         if (cctxPtr->prefs.frameInfo.contentSize != cctxPtr->totalInSize)
             return err0r(LZ4F_ERROR_frameSize_wrong);
+    }
+
+    if (!cctxPtr->prefs.mode) {
+        /* Destroy (free) FPGA Buffers */
+        for (idx = 0; idx < CHUNK_PARALLELISM; idx++) {
+            inaccel_free(cctxPtr->fpgaPtr->in[idx]);
+            inaccel_free(cctxPtr->fpgaPtr->out[idx]);
+            inaccel_free(cctxPtr->fpgaPtr->inBlockSize[idx]);
+            inaccel_free(cctxPtr->fpgaPtr->outBlockSize[idx]);
+        }
+        free(cctxPtr->fpgaPtr);
     }
 
     return (size_t)(dstPtr - dstStart);

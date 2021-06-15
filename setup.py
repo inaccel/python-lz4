@@ -59,8 +59,9 @@ lz4stream_sources = [
 ]
 
 if liblz4_found is True:
-    extension_kwargs['libraries'] = ['lz4']
+    extension_kwargs['libraries'] = ['lz4', 'coral-api']
 else:
+    extension_kwargs['libraries'] = ['coral-api']
     extension_kwargs['include_dirs'] = ['lz4libs']
     lz4version_sources.extend(
         [
@@ -88,6 +89,8 @@ else:
         ]
     )
 
+extension_kwargs['runtime_library_dirs'] = ['$ORIGIN/native']
+
 compiler = ccompiler.get_default_compiler()
 
 if compiler == 'msvc':
@@ -110,19 +113,19 @@ else:
     print('Unrecognized compiler: {0}'.format(compiler))
     sys.exit(1)
 
-lz4version = Extension('lz4._version',
+lz4version = Extension('inaccel.lz4._version',
                        lz4version_sources,
                        **extension_kwargs)
 
-lz4block = Extension('lz4.block._block',
+lz4block = Extension('inaccel.lz4.block._block',
                      lz4block_sources,
                      **extension_kwargs)
 
-lz4frame = Extension('lz4.frame._frame',
+lz4frame = Extension('inaccel.lz4.frame._frame',
                      lz4frame_sources,
                      **extension_kwargs)
 
-lz4stream = Extension('lz4.stream._stream',
+lz4stream = Extension('inaccel.lz4.stream._stream',
                       lz4stream_sources,
                       **extension_kwargs)
 
@@ -152,7 +155,7 @@ pytest_runner = ['pytest-runner'] if needs_pytest else []
 
 # Finally call setup with the extension modules as defined above.
 setup(
-    name='lz4',
+    name='inaccel-lz4',
     use_scm_version={
         'write_to': "lz4/version.py",
     },
@@ -167,7 +170,9 @@ setup(
     author='Jonathan Underwood',
     author_email='jonathan.underwood@gmail.com',
     url='https://github.com/python-lz4/python-lz4',
-    packages=find_packages(),
+    packages=list(map(lambda package: 'inaccel.' + package, find_packages())),
+    package_dir={'inaccel': ''},
+    package_data={'': ['frame/native/libcoral-api.so']},
     ext_modules=[
         lz4version,
         lz4block,

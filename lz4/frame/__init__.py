@@ -1,4 +1,4 @@
-import lz4
+import inaccel.lz4 as lz4
 import io
 import os
 import builtins
